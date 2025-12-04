@@ -10,7 +10,7 @@ from datetime import datetime
 # App config
 # -------------------------------------------------
 st.set_page_config(page_title="Sage Muni BWIC App With Algo Bids", layout="centered")
-st.title("Sage Muni BWIC App With Algo Bids")
+st.title("Sage Muni BWIC App With Algo Bids i")
 
 # -------------------------------------------------
 # Helpers
