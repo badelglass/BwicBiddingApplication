@@ -608,7 +608,7 @@ if run:
                 st.stop()
 
             # App B
-            reference_df, curve_data = load_reference_tables()
+            reference_df, curve_data, holdings_data = load_reference_tables()
             reference_df = prepare_reference_df(reference_df)
 
             app_b_display = compute_gspread_display(
@@ -618,27 +618,145 @@ if run:
                 metric_option=metric_option,
                 adjustment_bp=adjustment_bp
             )
+           ##SWAP OPPORTUNITY COMPONENT    
+               
             
-            
-            # Merge App A context (CUSIP)
             app_a_context_cols = [c for c in [
                 'Cusip','Par','Issuer','Days Since Rating Action','ERP',
-                'Final Rating','Duration Category','Muni Sector','Maturity-Call-Range'
+                'Final Rating','Duration Category','Muni Sector','Maturity-Call-Range','YrTMat'
             ] if c in filtered_full.columns]
-            
+
             app_a_context = filtered_full[app_a_context_cols].copy()
             if 'Cusip' in app_a_context.columns:
                 app_a_context = app_a_context.rename(columns={'Cusip':'CUSIP'})
-            
+
             final_df = app_b_display.merge(app_a_context, on='CUSIP', how='left')
 
+            # --- Ensure Duration Category exists after merge (handles _x/_y renames) ---
+            if 'Duration Category' not in final_df.columns:
+                if 'Duration Category_x' in final_df.columns:
+                    final_df['Duration Category'] = final_df['Duration Category_x']
+                elif 'Duration Category_y' in final_df.columns:
+                    final_df['Duration Category'] = final_df['Duration Category_y']
+                else:
+                    if 'Eff Dur' in final_df.columns:
+                        final_df['Duration Category'] = pd.to_numeric(final_df['Eff Dur'], errors='coerce').apply(classify_dur)
+                    else:
+                        final_df['Duration Category'] = np.nan
+
+            # --- Swap Opportunity: bucket-only + CRD_STRATEGY rule + Par condition ---
             
-            cols_order = ['CUSIP','Par','Issuer','Days Since Rating Action','ERP',
-                          'Bid Yield','BVAL Yld','Observations','Maturity-Call-Range']
+
+            holdings_data = holdings_data.copy()
+            holdings_data['G_SPREAD'] = pd.to_numeric(holdings_data.get('G_SPREAD'), errors='coerce')
+            holdings_data['TOTAL_SHARE_PAR_VALUE'] = pd.to_numeric(holdings_data.get('TOTAL_SHARE_PAR_VALUE'), errors='coerce')
+            holdings_data['CRD_STRATEGY'] = ensure_str(holdings_data.get('CRD_STRATEGY', pd.Series(dtype=str))).str.upper()
+            
+            # Derive DURATION_BUCKET if not present
+            if 'DURATION_BUCKET' not in holdings_data.columns:
+                if 'DURATION' in holdings_data.columns:
+                    holdings_data['DURATION_BUCKET'] = holdings_data['DURATION'].apply(classify_dur)
+                else:
+                    holdings_data['DURATION_BUCKET'] = np.nan
+            holdings_data['DURATION_BUCKET'] = ensure_str(holdings_data['DURATION_BUCKET'])
+            holdings_data['CUSIP'] = ensure_str(holdings_data.get('CUSIP', pd.Series(dtype=str)))
+            
+            # Ensure metric column is numeric & bucket normalized, Par numeric
+            final_df[metric_option] = pd.to_numeric(final_df[metric_option], errors='coerce')
+            final_df['Duration Category'] = ensure_str(final_df['Duration Category'])
+            final_df['Par'] = pd.to_numeric(final_df.get('Par', np.nan), errors='coerce').fillna(0.0)
+            
+            THRESH_BPS = 10  # minimum difference to qualify as a match
+            
+            def compute_swap_row(row):
+                bucket   = row.get('Duration Category', None)
+                metric   = pd.to_numeric(row.get(metric_option, np.nan), errors='coerce')
+                yrtmat   = pd.to_numeric(row.get('YrTMat', np.nan), errors='coerce')
+                par_val  = pd.to_numeric(row.get('Par', 0.0), errors='coerce')
+            
+                # Guard rails
+                if pd.isna(bucket) or not np.isfinite(metric):
+                    return pd.Series({
+                        'CRD_STRATEGY': '',
+                        'Swap Opportunity': 'N',
+                        'Matching CUSIPs': '',
+                        'Matching Total Par': 0.0,
+                        'Spread-Pick (bps)': None,
+                        'Matching Count': 0
+                    })
+            
+                # Strategy used per your rule
+                if np.isfinite(yrtmat) and (yrtmat <= 15) and (par_val >=1000):
+                    strategy_used = 'MINT'
+                    strat_mask = holdings_data['CRD_STRATEGY'] == 'MINT'
+                else:
+                    strategy_used = 'MUNI/MUNIW'
+                    strat_mask = holdings_data['CRD_STRATEGY'].isin(['MUNI','MUNIW'])
+            
+                # Bucket filter
+                candidates = holdings_data[strat_mask & (holdings_data['DURATION_BUCKET'] == str(bucket))].copy()
+                candidates = candidates.dropna(subset=['G_SPREAD', 'TOTAL_SHARE_PAR_VALUE'])
+                if candidates.empty:
+                    return pd.Series({
+                        'CRD_STRATEGY': strategy_used,
+                        'Swap Opportunity': 'N',
+                        'Matching CUSIPs': '',
+                        'Matching Total Par': 0.0,
+                        'Spread-Pick (bps)': None,
+                        'Matching Count': 0
+                    })
+            
+                # Difference = metric_option - holdings G_SPREAD (bps)
+                candidates['Diff_bps'] = metric - candidates['G_SPREAD']
+            
+                # Keep only matches with Diff_bps >= THRESH_BPS
+                matches = candidates[candidates['Diff_bps'] >= THRESH_BPS].copy()
+                matching_count = int(len(matches))
+                if matches.empty:
+                    # No qualifying spread difference in this bucket/strategy
+                    return pd.Series({
+                        'CRD_STRATEGY': strategy_used,
+                        'Swap Opportunity': 'N',
+                        'Matching CUSIPs': '',
+                        'Matching Total Par': 0.0,
+                        'Spread-Pick (bps)': float(candidates['Diff_bps'].max()) if 'Diff_bps' in candidates.columns else None,
+                        'Matching Count': 0
+                    })
+            
+                # Order by difference desc; display only the highest for CUSIP & difference
+                matches = matches.sort_values('Diff_bps', ascending=False).copy()
+                highest_row  = matches.iloc[0]
+                highest_diff = float(highest_row['Diff_bps'])
+                highest_cusip = str(highest_row['CUSIP']).strip()
+            
+                # Sum all matched holdings' par (full sum across all matches)
+                total_par_all_matches = float(matches['TOTAL_SHARE_PAR_VALUE'].sum())
+            
+                # Swap Opportunity only if Par >= Matching Total Par (full sum) and there is at least one match
+                swap_flag = 'Y' if (par_val <= total_par_all_matches and total_par_all_matches > 0) else 'N'
+            
+                return pd.Series({
+                    'CRD_STRATEGY': strategy_used,
+                    'Swap Opportunity': swap_flag,
+                    'Matching CUSIPs': highest_cusip,                 # show only the highest cusip
+                    'Matching Total Par': total_par_all_matches,      # sum of ALL matches that meet the threshold
+                    'Spread-Pick (bps)': round(highest_diff, 2),
+                    'Matching Count': matching_count
+                })
+            
+            swap_cols = final_df.apply(compute_swap_row, axis=1)
+            final_df  = pd.concat([final_df, swap_cols], axis=1)
+            
+            # Include new columns in the display
+            cols_order = [
+                'CUSIP','Par','Issuer','Days Since Rating Action','ERP',
+                'Bid Yield','BVAL Yld','Observations','Swap Opportunity','Spread-Pick (bps)',
+                'Matching Total Par','Matching Count','CRD_STRATEGY',
+                'Matching CUSIPs'
+            ]
             final_df = final_df[[c for c in cols_order if c in final_df.columns]]
 
-            
-            # Show all columns including Days Since Rating Action
+
             st.success("✅ Bonds Filtered and Bids Generated")
             st.dataframe(final_df, use_container_width=True)
 
