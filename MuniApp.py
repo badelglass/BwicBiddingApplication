@@ -6,15 +6,9 @@ import io
 from io import StringIO
 from datetime import datetime
 
-# -------------------------------------------------
-# App config
-# -------------------------------------------------
 st.set_page_config(page_title="Sage Muni BWIC App With Algo Bids", layout="centered")
 st.title("Sage Muni BWIC App With Algo Bids")
 
-# -------------------------------------------------
-# Helpers
-# -------------------------------------------------
 def classify_dur(dur_value: float):
     if pd.isna(dur_value): return 'Duration Not Available'
     if 0 <= dur_value < 1:   return '0-1'
@@ -25,15 +19,35 @@ def classify_dur(dur_value: float):
     if dur_value >= 10:      return '10+'
     return 'Duration Not Available'
 
+def call_name(maturity_years, call_spread, callable_flag):
+    if callable_flag == 'N': return "CallA"
+    if maturity_years >= 28:
+        if call_spread <= 23: return "CallA"
+        elif 23 < call_spread <= 26: return "CallB"
+        elif 26 < call_spread <= 30: return "CallC"
+        else: return "CallD"
+    if 24 < maturity_years < 28:
+        if call_spread <= 17: return "CallA"
+        elif 17 < call_spread <= 22: return 'CallB'
+        elif 22 < call_spread <= 26: return 'CallC'
+        else: return 'CallD'
+    if 15 <= maturity_years <= 24:
+        if call_spread <= 13: return "CallA"
+        elif 13 < call_spread <= 18: return 'CallB'
+        elif 18 < call_spread <= 22: return 'CallC'
+        else: return 'CallD'
+    if 10 < maturity_years < 15:
+        if call_spread <= 5: return "CallA"
+        elif 5 < call_spread <= 9: return 'CallB'
+        elif 9 < call_spread <= 12: return 'CallC'
+        else: return 'CallD'
+    if maturity_years <= 10:
+        if call_spread <= 3: return "CallA"
+        elif 3 < call_spread <= 5: return 'CallB'
+        else: return 'CallC'
+
 def ensure_str(series: pd.Series) -> pd.Series:
     return series.fillna('').astype(str).str.strip()
-
-def normalize_flag(series: pd.Series) -> pd.Series:
-    s = series.astype(str).str.strip().str.lower()
-    return s.replace({
-        'y':'Y','yes':'Y','true':'Y','t':'Y','1':'Y',
-        'n':'N','no':'N','false':'N','f':'N','0':'N'
-    })
 
 def get_first_existing_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     for c in candidates:
@@ -62,6 +76,7 @@ def filter_data_app_a(
     for dcol in ['Call Dt', 'Mat Dt', 'Put Dt']:
         if dcol in df.columns:
             df[dcol] = pd.to_datetime(df[dcol], format="%m/%d/%Y", errors='coerce')
+    df.loc[df['Callable'].eq('N'), 'Call Dt'] = df.loc[df['Callable'].eq('N'), 'Mat Dt']
     df = df.dropna(subset=['Mat Dt'])
     today = datetime.today()
 
@@ -71,9 +86,6 @@ def filter_data_app_a(
             df[c] = pd.to_numeric(df[c], errors='coerce')
 
     # Flags/text (upper for Y/N style; keep sector case)
-    for c in ['AMT','144A','Taxable','Sinkable','Putable','Prere','Issue Type','St','Insured']:
-        if c in df.columns:
-            df[c] = normalize_flag(df[c])
     for c in ['BB Sector','Cpn Typ']:  # preserve case
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
@@ -103,9 +115,14 @@ def filter_data_app_a(
     df['Eff Dur'] = pd.to_numeric(df['Eff Dur'], errors='coerce')
     df = df.dropna(subset=['Eff Dur'])
     df['Call Wndw'] = pd.to_numeric(df['Call Wndw'], errors='coerce')
-    mask_early = (df['Year'] <= 2039) & ((df['Call Wndw'] <= 5) | df['Call Wndw'].isna()) & (df['Eff Dur'] <= 10)
-    mask_late  = (df['Year'] >= 2040) & (df['Call Wndw'] >= 7) & (df['Eff Dur'] >= 8)
-    df = df[mask_early | mask_late]
+    mask_early = (df['YrTMat'] <= 15) & ((df['Call Wndw'] <= 5) | df['Call Wndw'].isna()) & (df['Eff Dur'] <= 10)
+    mask_late  = (df['YrTMat'] > 15) & (df['Call Wndw'] >= 5) & (df['Eff Dur'] >= 8)
+    #df = df[mask_early | mask_late]
+    if include_short_calls:
+        df = df
+    else:
+        df = df[mask_early | mask_late]
+    
 
     # Coupon type (allow Gas Forward)
     if {'Cpn Typ','BB Sector'}.issubset(df.columns):
@@ -158,6 +175,15 @@ def filter_data_app_a(
 
     df['Days Since Rating Action'] = df[['Moody Days','SP Days','Fitch Days']].min(axis=1) #want to be alerted of any recent rating actions
 
+    cond_missing_sp = (
+        df['SP Undr'].isna() |
+        df['SP Undr'].eq('') |
+        df['SP Undr'].isin(['#N/A N/A', 'N.A.', 'NA'])
+    )
+    cond_uninsured = (df['Insured'].str.upper() == 'N')
+    # Use S&amp;P column to backfill SP Undr
+    df.loc[cond_uninsured & cond_missing_sp, 'SP Undr'] = df.loc[cond_uninsured & cond_missing_sp, 'S&P']
+    
     # Rating normalization
     replacement_dicts = {
         "Mdy Undr": {'Aaa':1,'MIG1':1,'Aaa/VMIG1':1,'Aa1':2,'Aa2':3,'Aa2/VMIG1':3,'Aa3':4,'A1':5,'A2':6,'MIG2':6,'A3':7,'Baa1':8,'Baa2':9,'Baa3':10,
@@ -223,12 +249,13 @@ def filter_data_app_a(
 # -------------------------------------------------
 # App B — Snowflake reference + G-Spread
 # -------------------------------------------------
-@st.cache_data(ttl=1000)
+@st.cache_data(ttl=3600)
 def load_reference_tables():
     conn = st.connection("snowflake")
     reference_df = conn.query("SELECT * FROM TRADER_SANDBOX.BRETT_SANDBOX.MUNI_ALADDIN_DATA", ttl=1000)
     curve_data   = conn.query("SELECT * FROM TRADER_SANDBOX.BRETT_SANDBOX.AAA_MUNI_CURVE", ttl=1000)
-    return reference_df, curve_data
+    holdings_data = conn.query("SELECT * FROM TRADER_SANDBOX.BRETT_SANDBOX.MUNI_HOLDINGS_BY_STRATEGY", ttl=1000)
+    return reference_df, curve_data, holdings_data
 
 def prepare_reference_df(reference_df: pd.DataFrame) -> pd.DataFrame:
     reference_df = reference_df.copy()
@@ -277,33 +304,7 @@ def prepare_reference_df(reference_df: pd.DataFrame) -> pd.DataFrame:
     if 'DURATION' in reference_df.columns:
         reference_df['Duration Category'] = reference_df['DURATION'].apply(classify_dur)
 
-    def assign_name(maturity_years, call_spread, callable_flag):
-        if callable_flag == 'N': return "CallA"
-        if maturity_years >= 28:
-            if call_spread <= 23: return "CallA"
-            elif 23 < call_spread <= 26: return "CallB"
-            elif 26 < call_spread <= 30: return "CallC"
-            else: return "CallD"
-        if 24 < maturity_years < 28:
-            if call_spread <= 17: return "CallA"
-            elif 17 < call_spread <= 22: return 'CallB'
-            elif 22 < call_spread <= 26: return 'CallC'
-            else: return 'CallD'
-        if 15 <= maturity_years <= 24:
-            if call_spread <= 13: return "CallA"
-            elif 13 < call_spread <= 18: return 'CallB'
-            elif 18 < call_spread <= 22: return 'CallC'
-            else: return 'CallD'
-        if 10 < maturity_years < 15:
-            if call_spread <= 4: return "CallA"
-            elif 4 < call_spread <= 9: return 'CallB'
-            elif 9 < call_spread <= 12: return 'CallC'
-            else: return 'CallD'
-        if maturity_years <= 10:
-            if call_spread <= 3: return "CallA"
-            elif 3 < call_spread <= 5: return 'CallB'
-            else: return 'CallC'
-    reference_df['Maturity-Call-Range'] = reference_df.apply(lambda r: assign_name(r.get('Maturity Years From Today',np.nan), r.get('Call Wndw',np.nan), r.get('Callable','N')), axis=1)
+    reference_df['Maturity-Call-Range'] = reference_df.apply(lambda r: call_name(r.get('Maturity Years From Today',np.nan), r.get('Call Wndw',np.nan), r.get('Callable','N')), axis=1)
 
     for col in ['SP Undr','Sinkable','STATE','Muni Sector','Putable','Maturity-Call-Range','GUARANTOR_NAME']:
         if col in reference_df.columns:
@@ -345,37 +346,10 @@ def compute_gspread_display(input_df: pd.DataFrame,
     input_df['PREREFUNDED_FLAG'] = input_df.get('Prere', '')
     input_df['Call Wndw'] = pd.to_numeric(input_df.get('Call Wndw', 0), errors='coerce').fillna(0)
 
-    # Callable bands
-    def assign_name(maturity_years, call_spread, callable_flag):
-        if callable_flag == 'N': return "CallA"
-        if maturity_years >= 28:
-            if call_spread <= 23: return "CallA"
-            elif 23 < call_spread <= 26: return "CallB"
-            elif 26 < call_spread <= 30: return "CallC"
-            else: return "CallD"
-        if 24 < maturity_years < 28:
-            if call_spread <= 17: return "CallA"
-            elif 17 < call_spread <= 22: return 'CallB'
-            elif 22 < call_spread <= 26: return 'CallC'
-            else: return 'CallD'
-        if 15 <= maturity_years <= 24:
-            if call_spread <= 13: return "CallA"
-            elif 13 < call_spread <= 18: return 'CallB'
-            elif 18 < call_spread <= 22: return 'CallC'
-            else: return 'CallD'
-        if 10 < maturity_years < 15:
-            if call_spread <= 4: return "CallA"
-            elif 4 < call_spread <= 9: return 'CallB'
-            elif 9 < call_spread <= 12: return 'CallC'
-            else: return 'CallD'
-        if maturity_years <= 10:
-            if call_spread <= 3: return "CallA"
-            elif 3 < call_spread <= 5: return 'CallB'
-            else: return 'CallC'
     if 'Callable' not in input_df.columns and 'Call Dt' in input_df.columns:
         input_df['Callable'] = input_df['Call Dt'].notna().map({True: 'Y', False: 'N'})
     input_df['Maturity-Call-Range'] = input_df.apply(
-        lambda row: assign_name(pd.to_numeric(row.get('YrTMat'), errors='coerce'),
+        lambda row: call_name(pd.to_numeric(row.get('YrTMat'), errors='coerce'),
                                 pd.to_numeric(row.get('Call Wndw'), errors='coerce'),
                                 row.get('Callable','N')), axis=1
     )
@@ -424,15 +398,6 @@ def compute_gspread_display(input_df: pd.DataFrame,
     if 'Guaranty Agmt' in input_df.columns:
         input_df['GUARANTOR_NAME'] = ensure_str(input_df['Guaranty Agmt']).str.upper()
 
-    # Weighted percentile
-    def weighted_percentile(data: np.ndarray, weights: np.ndarray, q: float):
-        order = np.argsort(data)
-        data = data[order]; weights = weights[order]
-        cum_w = np.cumsum(weights)
-        cutoff = q * cum_w[-1]
-        idx = np.searchsorted(cum_w, cutoff)
-        return data[min(idx, len(data)-1)]
-
     results = []
     for _, row in input_df.iterrows():
         coupon_val = float(row['COUPON']) if pd.notna(row['COUPON']) else np.nan
@@ -471,12 +436,28 @@ def compute_gspread_display(input_df: pd.DataFrame,
             guarantor_key = str(row['GUARANTOR_NAME']).strip().upper()
             candidates = candidates[candidates['GUARANTOR_NAME'] == guarantor_key]
 
-        state_val = row.get('STATE','')
-        restricted_states = ['CA','NY','NJ']
-        if state_val in restricted_states:
-            candidates = candidates[candidates['STATE'] == state_val]
+        state_val = str(row.get('STATE', '')).strip().upper()
+        restricted_states = {'CA', 'NY', 'NJ'}
+        high_beta_states = {'TX'}
+
+        # >>> UPDATED: relax TX hard filter; rely on weighting to prefer same-state
+        if 'STATE' in candidates.columns:
+            if state_val in restricted_states:
+                candidates = candidates[candidates['STATE'].eq(state_val)]
+            elif state_val in high_beta_states:
+                candidates = candidates[~candidates['STATE'].isin(restricted_states)]
+            elif state_val != '':
+                candidates = candidates[~candidates['STATE'].isin(restricted_states)]
+        
+#this gets rid of states with negative spreads unless they're in the indicated states
+        allow_negative_states = {'CA', 'NY', 'NJ', 'CT', 'VA'}
+        candidates['G_SPREAD'] = pd.to_numeric(candidates['G_SPREAD'], errors='coerce')
+        if 'STATE' in candidates.columns:
+            allow_mask = candidates['STATE'].isin(allow_negative_states)
         else:
-            candidates = candidates[~candidates['STATE'].isin(restricted_states)]
+            allow_mask = pd.Series(False, index=candidates.index)
+        neg_mask = candidates['G_SPREAD'] < 0
+        candidates = candidates[~neg_mask | allow_mask]
 
         base_fields = {
             'CUSIP': row.get('Cusip') or row.get('CUSIP'),
@@ -487,30 +468,34 @@ def compute_gspread_display(input_df: pd.DataFrame,
             'Final Rating': final_rating_val,
             'YIELD': row.get('YIELD', np.nan),
             'BVAL Yld': pd.to_numeric(row.get('BVAL Yld', np.nan), errors='coerce'),
-            'Call Wndw': row.get('Call Wndw', np.nan)
+            'Maturity-Call-Range': row.get('Maturity-Call-Range', np.nan)
         }
 
         if not candidates.empty:
             gs = pd.to_numeric(candidates['G_SPREAD'], errors='coerce').dropna()
             if gs.empty:
-                results.append({**base_fields,'Median_GSpread':None,'P80_GSpread':None,'Max_GSpread':None,'Max_Plus_Gap75to100':None,'Observations':0})
+                results.append({
+                    **base_fields,
+                    'Median_GSpread': None,
+                    'P80_GSpread': None,
+                    'Max_GSpread': None,
+                    'Max_Plus_Gap75to100': None,
+                    'Observations': 0
+                })
                 continue
-
-            if state_val in ["TX","IL","FL"]:
-                candidates['Weight'] = candidates['STATE'].apply(lambda s: 1.3 if s == state_val else 1)
-            else:
-                candidates['Weight'] = 1
-
-            weights = candidates.loc[gs.index, 'Weight'].to_numpy()
+        
             gs_vals = gs.to_numpy()
-
-            def wperc(q): return weighted_percentile(gs_vals, weights, q)
-            median_gspread = wperc(0.50)
-            p80_gspread    = wperc(0.80)
+        
+            median_gspread = float(np.percentile(gs_vals, 50))
+            if state_val == 'IL':
+                p80_gspread = float(np.percentile(gs_vals, 95))
+            else:
+                p80_gspread = float(np.percentile(gs_vals, 80))
             max_gspread    = float(np.max(gs_vals))
             max_plus_gap   = (2 * max_gspread - p80_gspread)
-            obs_count      = len(gs_vals)
-
+            obs_count      = int(gs_vals.size)
+        
+            # Append only rounded values
             results.append({
                 **base_fields,
                 'Median_GSpread': round(median_gspread, 2) if np.isfinite(median_gspread) else None,
@@ -520,7 +505,14 @@ def compute_gspread_display(input_df: pd.DataFrame,
                 'Observations': obs_count
             })
         else:
-            results.append({**base_fields,'Median_GSpread':None,'P80_GSpread':None,'Max_GSpread':None,'Max_Plus_Gap75to100':None,'Observations':0})
+            results.append({
+                **base_fields,
+                'Median_GSpread': None,
+                'P80_GSpread': None,
+                'Max_GSpread': None,
+                'Max_Plus_Gap75to100': None,
+                'Observations': 0
+            })
 
     output_df = pd.DataFrame(results)
 
@@ -541,54 +533,51 @@ def compute_gspread_display(input_df: pd.DataFrame,
 
     return display_df
 
-# -------------------------------------------------
-# UI (single-button run)
-# -------------------------------------------------
-pasted = st.text_area(
-    "Paste tab‑separated BWIC data (include headers):",
-    height=220,
-    placeholder="Cusip\tPar\tIssuer\tEff Dur\tCpn\tYrTMat\tCall Dt\tMat Dt\tPut Dt\tSinkable\tPutable\tPrere\tSt\tBB Sector\tBB Sector 3\tBVAL Yld\tInsured\tAMT\t144A\tTaxable"
-)
+# Create one centered column
+col = st.columns([1, 3, 1])[1]  # middle column is wider
+with col:
+    # Paste area
+    pasted = st.text_area("Paste tab-separated BWIC data:", height=220)
 
-# Core controls
-colA, colB, colC = st.columns([1,1,1])
-with colA:
+    # Filters
     include_ca   = st.checkbox("Include CA", value=False)
     include_ny   = st.checkbox("Include NY", value=True)
-    st.markdown("**Duration buckets**")
-    duration_options    = ["0-1","1-2","2-3","3-6","6-10","10+"]
-    default_durations   = ["2-3","3-6","6-10","10+"]
-    selected_durations  = [opt for opt in duration_options if st.checkbox(opt, value=opt in default_durations, key=f"dur_{opt}")]
-with colB:
-    include_prere = st.checkbox("Include Pre‑refunded", value=False)
+    include_prere = st.checkbox("Include Pre-refunded", value=False)
+    include_short_calls = st.checkbox('Include Short Calls', value=False)
+
     start_year, end_year = st.slider("Maturity Year Range", 2025, 2060, (2025, 2060))
-    st.markdown("**Ratings**")
-    rating_options   = ["AAA","AA","A","BBB","HY"]
-    default_ratings  = ["AAA","AA","A","BBB"]
-    selected_ratings = [opt for opt in rating_options if st.checkbox(opt, value=opt in default_ratings, key=f"rt_{opt}")]
-with colC:
     coupon_lower = st.number_input("Coupon ≥", min_value=0.0, max_value=10.0, value=4.0, step=0.25)
     coupon_upper = st.number_input("Coupon ≤", min_value=0.0, max_value=10.0, value=5.0, step=0.25)
-    st.markdown("**Exclude Guarantors (Prepaid Gas)**")
+
+    st.markdown("**Ratings**")
+    rating_options = ["AAA","AA","A","BBB","HY"]
+    default_ratings = ["AAA","AA","A","BBB"]
+    selected_ratings = [opt for opt in rating_options if st.checkbox(opt, value=opt in default_ratings, key=f"rt_{opt}")]
+
+    st.markdown("**Duration buckets**")
+    duration_options = ["0-1","1-2","2-3","3-6","6-10","10+"]
+    default_durations = ["2-3","3-6","6-10","10+"]
+    selected_durations = [opt for opt in duration_options if st.checkbox(opt, value=opt in default_durations, key=f"dur_{opt}")]
+
+    st.markdown("**Exclude Guarantors**")
     guarantor_options = ['Athene','DB','MS','GS','RBC','Citi','PacLife','TD','JPM','BP']
     default_guarantors = ['Athene','DB']
-    guarantors_vars    = {opt: st.checkbox(opt, value=opt in default_guarantors, key=f"g_{opt}") for opt in guarantor_options}
+    guarantors_vars = {opt: st.checkbox(opt, value=opt in default_guarantors, key=f"g_{opt}") for opt in guarantor_options}
 
-st.markdown("---")
-metric_display_names = {
-    "Median": "Median_GSpread",
-    "80th Percentile": "P80_GSpread",
-    "Maximum": "Max_GSpread",
-    "Max + Gap (75th→100th)": "Max_Plus_Gap75to100"
-}
-metric_option_display = st.selectbox("Spread metric", list(metric_display_names.keys()), index=0)
-metric_option = metric_display_names[metric_option_display]
+    st.markdown("---")
+    metric_display_names = {
+        "Aggressive": "Median_GSpread",
+        "Normal": "P80_GSpread",
+        "Maximum Spread": "Max_GSpread",
+    }
+    metric_option_display = st.selectbox("Bid Type", list(metric_display_names.keys()), index=1)
+    metric_option = metric_display_names[metric_option_display]
 
-market_env = st.selectbox("Market environment (bps)", options=["Normal","+10","+20","+30"], index=0)
-adjustment_bp = {"Normal":0, "+10":10, "+20":20, "+30":30}[market_env]
+    market_env = st.selectbox("Market environment (bps)", options=["Normal","+10","+20","+30"], index=0)
+    adjustment_bp = {"Normal":0, "+10":10, "+20":20, "+30":30}[market_env]
 
-# ONE BUTTON
-run = st.button("▶️ Run Filters and Generate Bids", use_container_width=True)
+    # Run button
+    run = st.button("▶️ Run Filters and Generate Bids", use_container_width=True)
 
 if run:
     if not pasted.strip():
@@ -629,12 +618,12 @@ if run:
                 metric_option=metric_option,
                 adjustment_bp=adjustment_bp
             )
-
+            
             
             # Merge App A context (CUSIP)
             app_a_context_cols = [c for c in [
                 'Cusip','Par','Issuer','Days Since Rating Action','ERP',
-                'Final Rating','Duration Category','Muni Sector'
+                'Final Rating','Duration Category','Muni Sector','Maturity-Call-Range'
             ] if c in filtered_full.columns]
             
             app_a_context = filtered_full[app_a_context_cols].copy()
@@ -645,7 +634,7 @@ if run:
 
             
             cols_order = ['CUSIP','Par','Issuer','Days Since Rating Action','ERP',
-                          'Bid Yield','BVAL Yld','Observations']
+                          'Bid Yield','BVAL Yld','Observations','Maturity-Call-Range']
             final_df = final_df[[c for c in cols_order if c in final_df.columns]]
 
             
