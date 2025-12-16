@@ -490,7 +490,7 @@ def compute_gspread_display(input_df: pd.DataFrame,
             if state_val == 'IL':
                 p80_gspread = float(np.percentile(gs_vals, 95))
             else:
-                p80_gspread = float(np.percentile(gs_vals, 80))
+                p80_gspread = float(np.percentile(gs_vals, 75))
             max_gspread    = float(np.max(gs_vals))
             max_plus_gap   = (2 * max_gspread - p80_gspread)
             obs_count      = int(gs_vals.size)
@@ -575,6 +575,16 @@ with col:
 
     market_env = st.selectbox("Market environment (bps)", options=["Normal","+10","+20","+30"], index=0)
     adjustment_bp = {"Normal":0, "+10":10, "+20":20, "+30":30}[market_env]
+    crd_strategy = st.selectbox(
+        "CRD Strategy",
+        options=["All", "MINT", "MUNI/MUNIW","TOHAX"],
+        index=0
+    )
+    swap_filter = st.selectbox(
+        "Swap Opportunity",
+        options=["All", "Y"],
+        index=0)
+
 
     # Run button
     run = st.button("▶️ Run Filters and Generate Bids", use_container_width=True)
@@ -619,8 +629,7 @@ if run:
                 adjustment_bp=adjustment_bp
             )
            ##SWAP OPPORTUNITY COMPONENT    
-               
-            
+                          
             app_a_context_cols = [c for c in [
                 'Cusip','Par','Issuer','Days Since Rating Action','ERP',
                 'Final Rating','Duration Category','Muni Sector','Maturity-Call-Range','YrTMat'
@@ -646,7 +655,6 @@ if run:
 
             # --- Swap Opportunity: bucket-only + CRD_STRATEGY rule + Par condition ---
             
-
             holdings_data = holdings_data.copy()
             holdings_data['G_SPREAD'] = pd.to_numeric(holdings_data.get('G_SPREAD'), errors='coerce')
             holdings_data['TOTAL_SHARE_PAR_VALUE'] = pd.to_numeric(holdings_data.get('TOTAL_SHARE_PAR_VALUE'), errors='coerce')
@@ -666,7 +674,8 @@ if run:
             final_df['Duration Category'] = ensure_str(final_df['Duration Category'])
             final_df['Par'] = pd.to_numeric(final_df.get('Par', np.nan), errors='coerce').fillna(0.0)
             
-            THRESH_BPS = 10  # minimum difference to qualify as a match
+           
+            THRESH_BPS = 15  # minimum difference to qualify as a match
             
             def compute_swap_row(row):
                 bucket   = row.get('Duration Category', None)
@@ -674,7 +683,7 @@ if run:
                 yrtmat   = pd.to_numeric(row.get('YrTMat', np.nan), errors='coerce')
                 par_val  = pd.to_numeric(row.get('Par', 0.0), errors='coerce')
             
-                # Guard rails
+                # Guard rails: must have a bucket and a valid metric
                 if pd.isna(bucket) or not np.isfinite(metric):
                     return pd.Series({
                         'CRD_STRATEGY': '',
@@ -685,15 +694,22 @@ if run:
                         'Matching Count': 0
                     })
             
-                # Strategy used per your rule
-                if np.isfinite(yrtmat) and (yrtmat <= 15) and (par_val >=1000):
+                # --- NEW STRATEGY SELECTION RULES ---
+                # If input row Par == 500, restrict matches to CRD_STRATEGY == 'TOHAX'.
+                # Use a small tolerance to avoid float-equality pitfalls.
+                if np.isclose(par_val, 500.0, rtol=0.0, atol=1e-9):
+                    strategy_used = 'TOHAX'
+                    strat_mask = (holdings_data['CRD_STRATEGY'] == 'TOHAX')
+            
+                # Else keep your existing logic
+                elif np.isfinite(yrtmat) and (yrtmat <= 15) and (par_val >= 1000):
                     strategy_used = 'MINT'
-                    strat_mask = holdings_data['CRD_STRATEGY'] == 'MINT'
+                    strat_mask = (holdings_data['CRD_STRATEGY'] == 'MINT')
                 else:
                     strategy_used = 'MUNI/MUNIW'
-                    strat_mask = holdings_data['CRD_STRATEGY'].isin(['MUNI','MUNIW'])
+                    strat_mask = holdings_data['CRD_STRATEGY'].isin(['MUNI', 'MUNIW'])
             
-                # Bucket filter
+                # Bucket filter + basic hygiene
                 candidates = holdings_data[strat_mask & (holdings_data['DURATION_BUCKET'] == str(bucket))].copy()
                 candidates = candidates.dropna(subset=['G_SPREAD', 'TOTAL_SHARE_PAR_VALUE'])
                 if candidates.empty:
@@ -706,14 +722,12 @@ if run:
                         'Matching Count': 0
                     })
             
-                # Difference = metric_option - holdings G_SPREAD (bps)
+                # Compute spread pick vs holdings
                 candidates['Diff_bps'] = metric - candidates['G_SPREAD']
             
                 # Keep only matches with Diff_bps >= THRESH_BPS
                 matches = candidates[candidates['Diff_bps'] >= THRESH_BPS].copy()
-                matching_count = int(len(matches))
                 if matches.empty:
-                    # No qualifying spread difference in this bucket/strategy
                     return pd.Series({
                         'CRD_STRATEGY': strategy_used,
                         'Swap Opportunity': 'N',
@@ -723,30 +737,34 @@ if run:
                         'Matching Count': 0
                     })
             
-                # Order by difference desc; display only the highest for CUSIP & difference
+                # Sort to surface top match
                 matches = matches.sort_values('Diff_bps', ascending=False).copy()
-                highest_row  = matches.iloc[0]
-                highest_diff = float(highest_row['Diff_bps'])
+                highest_row   = matches.iloc[0]
+                highest_diff  = float(highest_row['Diff_bps'])
                 highest_cusip = str(highest_row['CUSIP']).strip()
             
-                # Sum all matched holdings' par (full sum across all matches)
-                total_par_all_matches = float(matches['TOTAL_SHARE_PAR_VALUE'].sum())
-            
-                # Swap Opportunity only if Par >= Matching Total Par (full sum) and there is at least one match
-                swap_flag = 'Y' if (par_val <= total_par_all_matches and total_par_all_matches > 0) else 'N'
+                # Capacity & swap flag (unchanged logic)
+                matching_count     = int(len(matches))
+                matching_total_par = float(matches['TOTAL_SHARE_PAR_VALUE'].sum())
+                swap_flag          = 'Y' if ((par_val) * 1000 <= matching_total_par and matching_total_par > 0) else 'N'
             
                 return pd.Series({
                     'CRD_STRATEGY': strategy_used,
                     'Swap Opportunity': swap_flag,
-                    'Matching CUSIPs': highest_cusip,                 # show only the highest cusip
-                    'Matching Total Par': total_par_all_matches,      # sum of ALL matches that meet the threshold
-                    'Spread-Pick (bps)': round(highest_diff, 2),
-                    'Matching Count': matching_count
-                })
-            
+                    'Matching CUSIPs': highest_cusip,            # show only the highest cusip
+                    'Matching Total Par': matching_total_par,     # sum of holdings par for matched set
+                    'Spread-Pick (bps)': round(highest_diff),        'Spread-Pick (bps)': round(highest_diff, 2),
+                    'Matching Count': matching_count})
+
+         
             swap_cols = final_df.apply(compute_swap_row, axis=1)
             final_df  = pd.concat([final_df, swap_cols], axis=1)
-            
+
+            if crd_strategy != "All":
+                final_df = final_df[final_df['CRD_STRATEGY'] == crd_strategy]           
+            if swap_filter == "Y":
+                final_df = final_df[final_df['Swap Opportunity'] == "Y"]
+         
             # Include new columns in the display
             cols_order = [
                 'CUSIP','Par','Issuer','Days Since Rating Action','ERP',
@@ -754,8 +772,8 @@ if run:
                 'Matching Total Par','Matching Count','CRD_STRATEGY',
                 'Matching CUSIPs'
             ]
+            
             final_df = final_df[[c for c in cols_order if c in final_df.columns]]
-
 
             st.success("✅ Bonds Filtered and Bids Generated")
             st.dataframe(final_df, use_container_width=True)
